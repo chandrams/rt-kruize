@@ -1,0 +1,171 @@
+pipeline {
+  agent {
+    node {
+        label "${LABEL}"
+    }
+  }
+  
+  stages {
+    stage('Setup') {
+      steps {
+        echo "#########################################################################################"
+        echo 'Cloning kruize repository from Git'
+        echo "#########################################################################################"
+        sh "rm -rf kruize"
+        echo "$KRUIZE_REPO $KRUIZE_BRANCH"
+        sh "git clone $KRUIZE_REPO"
+        sh "cd kruize; git checkout $KRUIZE_BRANCH"
+      }
+    }
+    
+    stage('Deploy') {
+      steps {
+        echo "#########################################################################################"
+        echo "Deploying kruize to ${CLUSTER_TYPE}"
+        echo "#########################################################################################"
+        script {
+            if ("${CLUSTER_TYPE}" == 'icp') {
+                //Terminating the previous docker containers
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -c $CLUSTER_TYPE -t"
+               
+                sh "cloudctl login -u $USER -p $PASSWORD -n $NAMESPACE -a https://${SERVER}:8443"
+                sh "kubectl delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml -n kube-system || true"
+		        sh "kubectl delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml -n kube-system || true"
+		        
+		        sh "kubectl create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml"
+		        sh "kubectl create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml"
+
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -ac $CLUSTER_TYPE -i $KRUIZE_IMAGE -k https://${SERVER}:8443 -u $USER -p $PASSWORD -n $NAMESPACE"
+                sleep 60
+
+            } else if ("${CLUSTER_TYPE}" == 'docker') {
+                
+                //Terminating the previous docker containers
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -c $CLUSTER_TYPE -t"
+                
+                sh "sudo minikube stop || true"
+                sh "sudo minikube delete || true"
+            
+                echo "Deploying $TARGET app, cleaning up..."
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET/scripts; ./$TARGET-cleanup.sh || true"
+                 echo "Deploying $TARGET app, performing the $TARGET setup..."
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET/scripts; ./$TARGET-setup.sh"
+                sleep 30
+                
+                echo "Deploying kruize..."
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -ac $CLUSTER_TYPE -i $KRUIZE_IMAGE --timeout=1200 &"
+                             
+            } else if ("${CLUSTER_TYPE}" == 'minikube') {
+                
+                // Terminating the previous deployments in minikube
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -c $CLUSTER_TYPE -t"
+                sh "sudo minikube stop || true"
+                sh "sudo minikube delete || true"
+                sh "sudo minikube start --vm-driver=none"
+                
+                sh "kubectl delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml -n kube-system || true"
+		        sh "kubectl delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml -n kube-system || true"
+		        
+		        sh "kubectl create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml"
+		        sh "kubectl create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml"
+
+                
+                sh "cd $WORKSPACE/kruize; ./deploy.sh -ac $CLUSTER_TYPE -i $KRUIZE_IMAGE" 
+                sleep 30
+
+            } else if ("${CLUSTER_TYPE}" == 'openshift') {
+                sh "oc login https://api.${SERVER}:6443 -u ${USER} -p ${PASSWORD} -n ${NAMESPACE}"
+                sh "oc delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml -n kube-system || true"
+		        sh "oc delete -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml -n kube-system || true"
+		        sh "oc delete route acmeair-service -n kube-system || true"
+		        
+		        sh "oc create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/mongo-db.yaml -n kube-system"
+		        sh "oc create -f $WORKSPACE/../rt-cloud-benchmarks/$TARGET/manifests/acmeair.yaml -n kube-system"
+		        sh "oc expose svc/acmeair-service -n kube-system"
+		        
+		        sh "cd $WORKSPACE/kruize; ./deploy.sh -ac $CLUSTER_TYPE -i $KRUIZE_IMAGE -k https://api.${SERVER}:6443 -u ${USER} -p ${PASSWORD}"
+
+            }
+        }        
+      }
+    }
+    
+    stage('Test') {
+      steps {
+        script {
+            echo "#########################################################################################"
+            echo 'Running jmeter work load'
+            echo "#########################################################################################"
+            
+            LOG = "$WORKSPACE/../rt-cloud-benchmarks/$TARGET/logs/kruize-log-${CLUSTER_TYPE}.txt"
+            echo "Kruize log = $LOG"
+            if ("${CLUSTER_TYPE}" == 'icp') {
+                
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET; tests/icp-load.sh $SERVER"
+             
+                // verify the kruize logs for expected messages
+                sh 'kubectl get pods -n ${NAMESPACE} | grep kruize | awk \'{print $1}\' > output.txt'
+                pod = readFile 'output.txt'
+                sh 'cat output.txt'
+                pod = "${pod}".trim()
+                echo "pod = ${pod}"
+                namespace = "${NAMESPACE}"
+                
+                sh "kubectl logs ${pod} -n ${NAMESPACE} | grep CPU"
+                sh "kubectl logs ${pod} -n ${NAMESPACE} > ${LOG}"
+                
+              
+            } else if ("${CLUSTER_TYPE}" == 'docker') {
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET/scripts; ./$TARGET-load.sh"
+
+                // verify the kruize logs for expected messages
+	        sh "docker logs kruize | grep CPU"
+	        sh "docker logs kruize > ${LOG}"
+		        
+            } else if ("${CLUSTER_TYPE}" == 'minikube') {
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET/scripts; ./$TARGET-load.sh 3 || true"
+
+                // verify the kruize logs for expected messages
+                sh 'kubectl get pods -n monitoring | grep kruize | awk \'{print $1}\' > output.txt'
+                pod = readFile 'output.txt'
+                sh 'cat output.txt'
+                pod="${pod}".trim()
+                echo "pod = ${pod}"
+                sh "kubectl logs ${pod} -n monitoring | grep CPU"
+                sh "kubectl logs ${pod} -n monitoring > ${LOG}"
+                
+                
+            } else  if ("${CLUSTER_TYPE}" == 'openshift') {
+                
+                sh "cd $WORKSPACE/../rt-cloud-benchmarks/$TARGET; tests/openshift-load.sh acmeair-service-kube-system.apps.kruize-oc.os.fyre.ibm.com"
+             
+                // verify the kruize logs for expected messages
+                sh 'oc get pods | grep kruize | awk \'{print $1}\' > output.txt'
+                pod = readFile 'output.txt'
+                sh 'cat output.txt'
+                pod = "${pod}".trim()
+                echo "pod = ${pod}"
+                namespace = "${NAMESPACE}"
+                
+                sh "oc logs ${pod} | grep CPU"
+                sh "oc logs ${pod} > ${LOG}"
+            } 
+            
+            sh "cp -R $WORKSPACE/../rt-cloud-benchmarks/$TARGET/logs kruize-$TARGET-logs-$CLUSTER_TYPE"
+            archive="kruize-${TARGET}-logs-${CLUSTER_TYPE}.tgz"
+		    echo "archive = $archive"
+		    sh "tar -zcvf $archive kruize-$TARGET-logs-$CLUSTER_TYPE"
+		    sh "rm -rf result-logs; mkdir result-logs; mv $archive result-logs"
+        }
+        
+      }
+      post {
+        always {
+          archiveArtifacts 'result-logs/*.tgz'
+        }
+      }
+    }
+  }
+} 
+
+
